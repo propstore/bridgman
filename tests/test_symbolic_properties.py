@@ -29,7 +29,7 @@ def test_dimensionless_base_accepts_symbolic_and_float_exponents() -> None:
     x = sp.Symbol("x")
     u = sp.Symbol("u")
 
-    assert dims_of_expr(2**x, {}) == {}
+    assert dims_of_expr(2**x, {"x": {}}) == {}
     assert dims_of_expr(u ** sp.Float("0.5"), {"u": {}}) == {}
 
 
@@ -38,7 +38,7 @@ def test_dimensioned_base_still_rejects_symbolic_exponent() -> None:
     n = sp.Symbol("n")
 
     with pytest.raises(DimensionalError, match="non-numeric exponent"):
-        dims_of_expr(x**n, {"x": {"L": 1}})
+        dims_of_expr(x**n, {"x": {"L": 1}, "n": {}})
 
 
 def test_atan2_accepts_equal_dimensioned_arguments() -> None:

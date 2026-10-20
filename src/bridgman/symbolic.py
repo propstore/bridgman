@@ -1,5 +1,7 @@
 """Dimensional analysis of sympy expression trees."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -19,6 +21,7 @@ from sympy import (
     Number,
     NumberSymbol,
     Pow,
+    preorder_traversal,
     Rational,
     sin,
     sinh,
@@ -46,6 +49,14 @@ class DimensionalError(Exception):
 
 
 @dataclass(frozen=True)
+class _PolymorphicZero:
+    """Proven zero, whose units can be instantiated; never missing evidence."""
+
+
+_ZERO = _PolymorphicZero()
+
+
+@dataclass(frozen=True)
 class _KindDetails:
     kind: str | None
     dimensions: Dimensions
@@ -68,10 +79,12 @@ def _dims_of_same_dimension_args(
     expr,
     dim_map: dict[str, Dimensions],
     context: str,
-) -> Dimensions:
-    dims_list = [dims_of_expr(arg, dim_map) for arg in expr.args]
+) -> Dimensions | _PolymorphicZero:
+    # Visit every operand before choosing units, including operands after zero.
+    terms = [_dimension_term(arg, dim_map) for arg in expr.args]
+    dims_list = [term for term in terms if not isinstance(term, _PolymorphicZero)]
     if not dims_list:
-        return {}
+        return _ZERO if terms else {}
 
     first = dims_list[0]
     for i, dims in enumerate(dims_list[1:], 1):
@@ -109,13 +122,28 @@ def _pow_exponent_fraction(exponent) -> Fraction:
         raise DimensionalError(
             f"floating exponent in power expression is not dimensionally exact: {exponent}"
         )
+    if isinstance(exponent, Add):
+        return sum((_pow_exponent_fraction(arg) for arg in exponent.args), Fraction(0))
+    if isinstance(exponent, Mul):
+        result = Fraction(1)
+        for arg in exponent.args:
+            result *= _pow_exponent_fraction(arg)
+        return result
+    if isinstance(exponent, Pow):
+        base = _pow_exponent_fraction(exponent.args[0])
+        power = _pow_exponent_fraction(exponent.args[1])
+        if power.denominator == 1:
+            try:
+                return base ** int(power)
+            except ZeroDivisionError as exc:
+                raise DimensionalError("undefined numeric exponent arithmetic") from exc
     raise DimensionalError(f"non-numeric exponent in power expression: {exponent}")
 
 
 def _dims_of_dimensionless_arg_function(expr, dim_map: dict[str, Dimensions]) -> Dimensions:
     for arg in expr.args:
-        arg_dims = dims_of_expr(arg, dim_map)
-        if not is_dimensionless(arg_dims):
+        arg_dims = _dimension_term(arg, dim_map)
+        if not isinstance(arg_dims, _PolymorphicZero) and not is_dimensionless(arg_dims):
             raise DimensionalError(
                 f"{expr.func.__name__} argument must be dimensionless; got {arg_dims}"
             )
@@ -135,7 +163,16 @@ def dims_of_expr(expr, dim_map: dict[str, Dimensions]) -> Dimensions:
     Raises:
         KeyError: If a symbol is not found in dim_map.
         DimensionalError: If dimensions are inconsistent (e.g. in addition).
+
+    A polymorphic zero has no single required signature. This dictionary API
+    returns its dimensionless instantiation; relation checking retains its
+    polymorphism until both sides have been checked.
     """
+    term = _dimension_term(expr, dim_map)
+    return {} if isinstance(term, _PolymorphicZero) else term
+
+
+def _dimension_term(expr, dim_map: dict[str, Dimensions]) -> Dimensions | _PolymorphicZero:
     if isinstance(expr, Symbol):
         name = expr.name
         if name not in dim_map:
@@ -143,18 +180,32 @@ def dims_of_expr(expr, dim_map: dict[str, Dimensions]) -> Dimensions:
         return _clean(dict(dim_map[name]))
 
     if isinstance(expr, (Number, NumberSymbol)):
-        # Numeric constants (Integer, Rational, Float, pi, etc.) are dimensionless
-        return {}
+        return _ZERO if expr.is_zero is True else {}
 
     if isinstance(expr, Mul):
+        terms = [_dimension_term(arg, dim_map) for arg in expr.args]
+        if any(isinstance(term, _PolymorphicZero) for term in terms):
+            return _ZERO
         result: Dimensions = {}
-        for arg in expr.args:
-            result = mul_dims(result, dims_of_expr(arg, dim_map))
+        for term in terms:
+            if not isinstance(term, _PolymorphicZero):
+                result = mul_dims(result, term)
         return result
 
     if isinstance(expr, Pow):
-        base_dims = dims_of_expr(expr.args[0], dim_map)
+        base_dims = _dimension_term(expr.args[0], dim_map)
         exponent = expr.args[1]
+        exponent_dims = _dimension_term(exponent, dim_map)
+        if not isinstance(exponent_dims, _PolymorphicZero) and not is_dimensionless(exponent_dims):
+            raise DimensionalError(f"power exponent must be dimensionless; got {exponent_dims}")
+
+        if isinstance(base_dims, _PolymorphicZero):
+            # Exact nonzero rational powers retain the literal's unit freedom.
+            if all(isinstance(node, (Rational, Add, Mul, Pow)) for node in preorder_traversal(exponent)):
+                exp_frac = _pow_exponent_fraction(exponent)
+                return _ZERO if exp_frac else {}
+            # Variable/float powers can instantiate the base dimensionlessly.
+            return {}
 
         if is_dimensionless(base_dims):
             return {}
@@ -182,7 +233,7 @@ def dims_of_expr(expr, dim_map: dict[str, Dimensions]) -> Dimensions:
         return {}
 
     if getattr(expr, "func", None) == Abs:
-        return dims_of_expr(expr.args[0], dim_map)
+        return _dimension_term(expr.args[0], dim_map)
 
     if getattr(expr, "func", None) in {Min, Max}:
         return _dims_of_same_dimension_args(expr, dim_map, expr.func.__name__)
@@ -190,7 +241,19 @@ def dims_of_expr(expr, dim_map: dict[str, Dimensions]) -> Dimensions:
     raise DimensionalError(f"Unsupported sympy expression type: {type(expr).__name__}")
 
 
-def verify_expr(eq, dim_map: dict[str, Dimensions]) -> bool:
+def _relation_dimensions(eq: object, dim_map: dict[str, Dimensions]) -> tuple[Dimensions, Dimensions]:
+    if not isinstance(eq, Relational):
+        raise TypeError(f"Expected sympy relational expression, got {type(eq).__name__}")
+    lhs = _dimension_term(eq.args[0], dim_map)
+    rhs = _dimension_term(eq.args[1], dim_map)
+    if isinstance(lhs, _PolymorphicZero):
+        lhs = {} if isinstance(rhs, _PolymorphicZero) else rhs
+    if isinstance(rhs, _PolymorphicZero):
+        rhs = lhs
+    return lhs, rhs
+
+
+def verify_expr(eq: object, dim_map: dict[str, Dimensions]) -> bool:
     """Verify that both sides of a sympy relation have the same dimensions.
 
     Args:
@@ -200,11 +263,7 @@ def verify_expr(eq, dim_map: dict[str, Dimensions]) -> bool:
     Returns:
         True if both sides have matching dimensions, False otherwise.
     """
-    if not isinstance(eq, Relational):
-        raise TypeError(f"Expected sympy relational expression, got {type(eq).__name__}")
-
-    lhs_dims = dims_of_expr(eq.args[0], dim_map)
-    rhs_dims = dims_of_expr(eq.args[1], dim_map)
+    lhs_dims, rhs_dims = _relation_dimensions(eq, dim_map)
     return dims_equal(lhs_dims, rhs_dims)
 
 
@@ -398,8 +457,7 @@ def explain_expr(eq, dim_map: dict[str, Dimensions]) -> CheckResult:
         raise TypeError(f"Expected sympy relational expression, got {type(eq).__name__}")
 
     try:
-        lhs_dims = dims_of_expr(eq.args[0], dim_map)
-        rhs_dims = dims_of_expr(eq.args[1], dim_map)
+        lhs_dims, rhs_dims = _relation_dimensions(eq, dim_map)
     except Exception as exc:
         return CheckResult(False, reason=str(exc), steps=(str(exc),))
 
