@@ -68,7 +68,7 @@ def test_symbolic_pow_wraps_type_error(dim_map):
     """x**n with symbolic n raises a dimensional error, not a raw TypeError."""
     x, n = Symbol("x"), Symbol("n")
     with pytest.raises(DimensionalError, match="non-numeric exponent"):
-        dims_of_expr(x**n, {**dim_map, "x": {"L": 1}})
+        dims_of_expr(x**n, {**dim_map, "x": {"L": 1}, "n": {}})
 
 
 def test_dims_of_div(dim_map):
